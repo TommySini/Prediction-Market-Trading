@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import math
 import signal
 import ssl
 import time
@@ -26,8 +25,10 @@ log = logging.getLogger(__name__)
 
 BINANCE_WS = "wss://data-stream.binance.vision"
 SYMBOL = "btcusdt"
-THRESHOLD_USD = 8.0
+THRESHOLD_USD = 4.0
 ORDER_SIZE = 5.0
+BUY_TTL_S = 5
+BUY_POLL_INTERVAL_S = 0.5
 SELL_DELAY_S = 5
 RECONNECT_DELAY_S = 3
 MAX_RECONNECT_DELAY_S = 60
@@ -128,16 +129,19 @@ async def _polymarket_loop(shutdown: asyncio.Event, state: BookState) -> None:
                         asks = data.get("asks") or data.get("sells") or []
                         bids = data.get("bids") or data.get("buys") or []
 
+                        best_ask = min((float(o["price"]) for o in asks), default=None)
+                        best_bid = max((float(o["price"]) for o in bids), default=None)
+
                         if asset_id == state.yes_token_id:
-                            if asks:
-                                state.best_ask_yes = float(asks[0]["price"])
-                            if bids:
-                                state.best_bid_yes = float(bids[0]["price"])
+                            if best_ask is not None:
+                                state.best_ask_yes = best_ask
+                            if best_bid is not None:
+                                state.best_bid_yes = best_bid
                         elif asset_id == state.no_token_id:
-                            if asks:
-                                state.best_ask_no = float(asks[0]["price"])
-                            if bids:
-                                state.best_bid_no = float(bids[0]["price"])
+                            if best_ask is not None:
+                                state.best_ask_no = best_ask
+                            if best_bid is not None:
+                                state.best_bid_no = best_bid
 
                         state.updated_ts = time.monotonic()
 
@@ -256,45 +260,61 @@ async def _place_order(
             user_auth.place_limit_order,
             client, token_id, "BUY", price, ORDER_SIZE,
         )
-        log.info("[ORDER] BUY %s filled: %s", side_label, resp)
+        log.info("[ORDER] BUY %s posted: %s", side_label, resp)
     except Exception:
         log.exception("[ORDER] BUY %s failed (delta=%+.2f mid=%.2f)", side_label, delta, mid)
         return
 
-    # ── SELL after delay ──
-    await asyncio.sleep(SELL_DELAY_S)
-
-    if side_label == "YES":
-        best_bid = state.best_bid_yes
-        best_ask = state.best_ask_yes
-    else:
-        best_bid = state.best_bid_no
-        best_ask = state.best_ask_no
-
-    if best_bid is not None and best_ask is not None:
-        sell_price = math.floor((best_bid + best_ask) / 2 * 100) / 100
-        log.info(
-            "[SELL] %s mid=%.4f (bid=%.4f ask=%.4f) → SELL @ %.2f x%.0f",
-            side_label, (best_bid + best_ask) / 2, best_bid, best_ask, sell_price, ORDER_SIZE,
-        )
-    elif best_ask is not None:
-        sell_price = best_ask
-        log.info(
-            "[SELL] %s bid unavailable, using ask=%.4f → SELL @ %.2f x%.0f",
-            side_label, best_ask, sell_price, ORDER_SIZE,
-        )
-    else:
-        log.warning("[SELL] %s bid/ask not available — skipping sell", side_label)
+    order_id = resp.get("orderID") or resp.get("id")
+    if not order_id:
+        log.error("[ORDER] BUY %s — no order ID in response: %s", side_label, resp)
         return
 
+    # ── Poll for fill (up to BUY_TTL_S) ──
+    filled = 0.0
+    deadline = time.monotonic() + BUY_TTL_S
+    while time.monotonic() < deadline:
+        await asyncio.sleep(BUY_POLL_INTERVAL_S)
+        try:
+            order = await asyncio.to_thread(client.get_order, order_id)
+            filled = float(order.get("size_matched", 0))
+            status = order.get("status", "")
+            if filled >= ORDER_SIZE or status not in ("LIVE", "OPEN", ""):
+                break
+        except Exception:
+            log.warning("[POLL] failed to fetch order %s", order_id)
+
+    # ── Cancel unfilled remainder ──
+    if filled < ORDER_SIZE:
+        try:
+            await asyncio.to_thread(client.cancel, order_id)
+            log.info("[CANCEL] BUY %s remainder cancelled (filled=%.2f/%.0f)", side_label, filled, ORDER_SIZE)
+        except Exception:
+            log.warning("[CANCEL] BUY %s cancel failed (may already be fully filled)", side_label)
+
+    if filled <= 0:
+        log.info("[ORDER] BUY %s nothing filled after %ds — aborting", side_label, BUY_TTL_S)
+        return
+
+    log.info("[ORDER] BUY %s filled %.2f shares", side_label, filled)
+
+    # ── SELL after holding delay ──
+    await asyncio.sleep(SELL_DELAY_S)
+
+    best_bid = state.best_bid_yes if side_label == "YES" else state.best_bid_no
+    if best_bid is None:
+        log.warning("[SELL] %s best bid not available — skipping sell", side_label)
+        return
+
+    log.info("[SELL] %s → SELL @ %.4f x%.2f", side_label, best_bid, filled)
     try:
         resp = await asyncio.to_thread(
             user_auth.place_limit_order,
-            client, token_id, "SELL", sell_price, ORDER_SIZE,
+            client, token_id, "SELL", best_bid, filled,
         )
-        log.info("[ORDER] SELL %s filled: %s", side_label, resp)
+        log.info("[ORDER] SELL %s posted: %s", side_label, resp)
     except Exception:
-        log.exception("[ORDER] SELL %s failed (sell_price=%.2f)", side_label, sell_price)
+        log.exception("[ORDER] SELL %s failed (price=%.4f size=%.2f)", side_label, best_bid, filled)
 
 
 # ── Entrypoint ───────────────────────────────────────────────────────
