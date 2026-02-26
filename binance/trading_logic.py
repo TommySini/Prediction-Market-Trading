@@ -25,7 +25,7 @@ log = logging.getLogger(__name__)
 
 BINANCE_WS = "wss://data-stream.binance.vision"
 SYMBOL = "btcusdt"
-THRESHOLD_USD = 4.0
+THRESHOLD_USD = 10.0
 ORDER_SIZE = 5.0
 BUY_TTL_S = 5
 BUY_POLL_INTERVAL_S = 0.5
