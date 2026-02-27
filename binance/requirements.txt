@@ -1,3 +1,4 @@
+aiohttp
 py-clob-client
 python-dotenv
 websockets

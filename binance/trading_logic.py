@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import signal
 import ssl
 import time
@@ -25,11 +26,12 @@ log = logging.getLogger(__name__)
 
 BINANCE_WS = "wss://data-stream.binance.vision"
 SYMBOL = "btcusdt"
-THRESHOLD_USD = 10.0
+THRESHOLD_USD = 0.08
 ORDER_SIZE = 5.0
+MIN_NOTIONAL = 1.0
 BUY_TTL_S = 5
 BUY_POLL_INTERVAL_S = 0.5
-SELL_DELAY_S = 5
+SELL_DELAY_S = 3
 RECONNECT_DELAY_S = 3
 MAX_RECONNECT_DELAY_S = 60
 
@@ -254,13 +256,16 @@ async def _place_order(
     delta: float,
     mid: float,
 ) -> None:
+    # ── Effective size: at least ORDER_SIZE, bumped up if notional < MIN_NOTIONAL ──
+    size = ORDER_SIZE if price * ORDER_SIZE >= MIN_NOTIONAL else math.ceil(MIN_NOTIONAL / price)
+
     # ── BUY ──
     try:
         resp = await asyncio.to_thread(
             user_auth.place_limit_order,
-            client, token_id, "BUY", price, ORDER_SIZE,
+            client, token_id, "BUY", price, size,
         )
-        log.info("[ORDER] BUY %s posted: %s", side_label, resp)
+        log.info("[ORDER] BUY %s posted (size=%.0f): %s", side_label, size, resp)
     except Exception:
         log.exception("[ORDER] BUY %s failed (delta=%+.2f mid=%.2f)", side_label, delta, mid)
         return
@@ -279,16 +284,16 @@ async def _place_order(
             order = await asyncio.to_thread(client.get_order, order_id)
             filled = float(order.get("size_matched", 0))
             status = order.get("status", "")
-            if filled >= ORDER_SIZE or status not in ("LIVE", "OPEN", ""):
+            if filled >= size or status not in ("LIVE", "OPEN", ""):
                 break
         except Exception:
             log.warning("[POLL] failed to fetch order %s", order_id)
 
     # ── Cancel unfilled remainder ──
-    if filled < ORDER_SIZE:
+    if filled < size:
         try:
             await asyncio.to_thread(client.cancel, order_id)
-            log.info("[CANCEL] BUY %s remainder cancelled (filled=%.2f/%.0f)", side_label, filled, ORDER_SIZE)
+            log.info("[CANCEL] BUY %s remainder cancelled (filled=%.2f/%.0f)", side_label, filled, size)
         except Exception:
             log.warning("[CANCEL] BUY %s cancel failed (may already be fully filled)", side_label)
 
