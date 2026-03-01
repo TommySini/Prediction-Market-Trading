@@ -296,6 +296,23 @@ class CalibrationState:
     market_end_ts: float = 0.0
 
 
+@dataclass
+class PendingOpp:
+    """Tracks an opportunity awaiting its 1-second outcome label."""
+    opp_id: int
+    t_ns: int           # time.monotonic_ns() when opportunity was logged
+    slug: str
+    yes_ask: float
+    no_ask: float
+    yes_mid: float
+    no_mid: float
+    bin_mid: float
+    fair_yes: float
+
+
+_OUTCOME_DELAY_NS = 1_000_000_000   # 1 second in nanoseconds
+
+
 def calibrate_on_poly_update(
     *,
     cal: CalibrationState,
@@ -642,6 +659,7 @@ class AsyncDBLogger:
         conn = sqlite3.connect(str(self.db_path))
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
+        # ---- Original lightweight tables (monitoring / trade log) ----
         conn.execute("""
             CREATE TABLE IF NOT EXISTS live_trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -675,6 +693,65 @@ class AsyncDBLogger:
                 fair_yes REAL,
                 source TEXT
             )
+        """)
+        # ---- Full opportunity + outcome tables (same schema as trader_log.snapshot.db) ----
+        # This enables RL_backtester / RL_1_hour load_rows() to read directly from live DB.
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS opportunities (
+                opp_id         INTEGER PRIMARY KEY,
+                t_ms           INTEGER NOT NULL,
+                mono_ns        INTEGER,
+                bin_evt_ms     REAL,
+                poly_evt_ms    REAL,
+                slug           TEXT,
+                yes_token_id   TEXT,
+                no_token_id    TEXT,
+                yes_bid        REAL,
+                yes_ask        REAL,
+                no_bid         REAL,
+                no_ask         REAL,
+                yes_mid        REAL,
+                no_mid         REAL,
+                spread_yes_c   REAL,
+                spread_no_c    REAL,
+                bin_mid        REAL,
+                bin_dS         REAL,
+                fair_yes       REAL,
+                edge_yes_pp    REAL,
+                edge_no_pp     REAL,
+                dp_fair_cents  REAL,
+                dP_yes_cents   REAL,
+                dP_no_cents    REAL,
+                lag_ratio      REAL,
+                inv_yes        REAL,
+                inv_no         REAL,
+                inv_net        REAL,
+                inv_gross      REAL,
+                inv_notional   REAL,
+                sigma_eff      REAL,
+                T_left_sec     REAL,
+                candidates     TEXT,
+                passed_filter  INTEGER,
+                state_json     TEXT
+            );
+            CREATE TABLE IF NOT EXISTS outcomes (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                opp_id         INTEGER NOT NULL,
+                action_id      INTEGER,
+                label_t_ms     INTEGER NOT NULL,
+                yes_mid_1s     REAL,
+                no_mid_1s      REAL,
+                bin_mid_1s     REAL,
+                fair_yes_1s    REAL,
+                pnl_1s         REAL,
+                pnl_1s_yes     REAL,
+                pnl_1s_no      REAL,
+                best_pnl_1s    REAL,
+                reward         REAL,
+                FOREIGN KEY (opp_id) REFERENCES opportunities(opp_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_opp_tms ON opportunities(t_ms);
+            CREATE INDEX IF NOT EXISTS idx_out_opp ON outcomes(opp_id);
         """)
         conn.commit()
 
@@ -739,6 +816,39 @@ class AsyncDBLogger:
         except queue.Full:
             pass
 
+    def log_opportunity(self, row: tuple) -> None:
+        sql = (
+            "INSERT OR IGNORE INTO opportunities "
+            "(opp_id, t_ms, mono_ns, slug, "
+            "yes_bid, yes_ask, no_bid, no_ask, "
+            "yes_mid, no_mid, spread_yes_c, spread_no_c, "
+            "bin_mid, bin_dS, fair_yes, "
+            "edge_yes_pp, edge_no_pp, "
+            "dp_fair_cents, dP_yes_cents, dP_no_cents, "
+            "lag_ratio, "
+            "inv_yes, inv_no, inv_net, inv_gross, inv_notional, "
+            "sigma_eff, T_left_sec, "
+            "passed_filter) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        )
+        try:
+            self._q.put_nowait((sql, row))
+        except queue.Full:
+            pass
+
+    def log_outcome(self, row: tuple) -> None:
+        sql = (
+            "INSERT INTO outcomes "
+            "(opp_id, label_t_ms, "
+            "yes_mid_1s, no_mid_1s, bin_mid_1s, fair_yes_1s, "
+            "pnl_1s, pnl_1s_yes, pnl_1s_no, best_pnl_1s) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)"
+        )
+        try:
+            self._q.put_nowait((sql, row))
+        except queue.Full:
+            pass
+
     def close(self) -> None:
         try:
             self._q.put(_DB_STOP, timeout=2.0)
@@ -754,6 +864,12 @@ class NullDBLogger:
         return
 
     def log_snapshot(self, row: tuple) -> None:
+        return
+
+    def log_opportunity(self, row: tuple) -> None:
+        return
+
+    def log_outcome(self, row: tuple) -> None:
         return
 
     def close(self) -> None:
@@ -794,6 +910,20 @@ def _retrain_worker(
 
         # Load historical rows
         hist_rows = rl_load_rows(Path(historical_db_path))
+        log.info("[retrain] loaded %d rows from historical DB", len(hist_rows))
+
+        # Load live rows (same opportunities+outcomes schema now)
+        live_rows: list = []
+        if Path(live_db_path).exists():
+            try:
+                live_rows = rl_load_rows(Path(live_db_path))
+                log.info("[retrain] loaded %d rows from live DB", len(live_rows))
+            except Exception as e:
+                log.warning("[retrain] could not load live DB: %s", e)
+
+        # Merge: combine historical and live data for training
+        all_rows = hist_rows + live_rows
+        log.info("[retrain] total rows for training: %d", len(all_rows))
 
         # Build args namespace for sample building  (defaults match RL_1_hour)
         ns = argparse.Namespace(
@@ -812,7 +942,7 @@ def _retrain_worker(
             max_inventory_per_side=1000.0,
         )
 
-        X, y = materialize_samples(hist_rows, args=ns)
+        X, y = materialize_samples(all_rows, args=ns)
         if X.shape[0] == 0:
             log.warning("[retrain] no samples built, skipping")
             return
@@ -896,6 +1026,10 @@ async def strategy_loop(
     # ---- Token warmup done? ----
     warmed: bool = False
 
+    # ---- Opportunity tracking (for training data) ----
+    opp_id_counter = int(time.time() * 1000)   # start from wall-clock ms to avoid collisions
+    pending_opps: deque[PendingOpp] = deque()
+
     events_total = 0
     events_binance = 0
     events_poly = 0
@@ -907,6 +1041,25 @@ async def strategy_loop(
         try:
             source = await asyncio.wait_for(q.get(), timeout=1.0)
         except asyncio.TimeoutError:
+            # Still process pending outcome labels on timeout
+            _now_mono = time.monotonic_ns()
+            while pending_opps and (_now_mono - pending_opps[0].t_ns) >= _OUTCOME_DELAY_NS:
+                _po = pending_opps.popleft()
+                _y1 = (float(snap.poly_yes_bid) + float(snap.poly_yes_ask)) * 0.5 if snap.poly_yes_bid and snap.poly_yes_ask else None
+                _n1 = (float(snap.poly_no_bid) + float(snap.poly_no_ask)) * 0.5 if snap.poly_no_bid and snap.poly_no_ask else None
+                _b1 = float(snap.binance_mid) if snap.binance_mid else None
+                _f1 = fair_prob_yes_live(S=_b1, cal=cal, args=args) if _b1 else None
+                _pnl_yes = (_y1 - _po.yes_ask) if _y1 is not None else None
+                _pnl_no = (_n1 - _po.no_ask) if _n1 is not None else None
+                _bp = max(_pnl_yes if _pnl_yes is not None else -999.0,
+                          _pnl_no if _pnl_no is not None else -999.0)
+                _best = _bp if _bp > -999.0 else None
+                db_logger.log_outcome((
+                    _po.opp_id, int(time.time_ns() // 1_000_000),
+                    _y1, _n1, _b1, _f1,
+                    None,  # pnl_1s (deprecated)
+                    _pnl_yes, _pnl_no, _best,
+                ))
             continue
 
         events_total += 1
@@ -914,6 +1067,26 @@ async def strategy_loop(
             events_binance += 1
         else:
             events_poly += 1
+
+        # ---- Process pending outcome labels (1-second delayed) ----
+        _now_mono = time.monotonic_ns()
+        while pending_opps and (_now_mono - pending_opps[0].t_ns) >= _OUTCOME_DELAY_NS:
+            _po = pending_opps.popleft()
+            _y1 = (float(snap.poly_yes_bid) + float(snap.poly_yes_ask)) * 0.5 if snap.poly_yes_bid and snap.poly_yes_ask else None
+            _n1 = (float(snap.poly_no_bid) + float(snap.poly_no_ask)) * 0.5 if snap.poly_no_bid and snap.poly_no_ask else None
+            _b1 = float(snap.binance_mid) if snap.binance_mid else None
+            _f1 = fair_prob_yes_live(S=_b1, cal=cal, args=args) if _b1 else None
+            _pnl_yes = (_y1 - _po.yes_ask) if _y1 is not None else None
+            _pnl_no = (_n1 - _po.no_ask) if _n1 is not None else None
+            _bp = max(_pnl_yes if _pnl_yes is not None else -999.0,
+                      _pnl_no if _pnl_no is not None else -999.0)
+            _best = _bp if _bp > -999.0 else None
+            db_logger.log_outcome((
+                _po.opp_id, int(time.time_ns() // 1_000_000),
+                _y1, _n1, _b1, _f1,
+                None,  # pnl_1s (deprecated)
+                _pnl_yes, _pnl_no, _best,
+            ))
 
         # ---- Read snapshot ----
         slug = str(snap.market_slug or "")
@@ -1050,8 +1223,52 @@ async def strategy_loop(
             abs(dP_yes) > float(args.poly_both_moved_cents)
             and abs(dP_no) > float(args.poly_both_moved_cents)
         )
+        _passed_filter = 1 if (fair_moved and poly_not_moved) else 0
 
-        if not (fair_moved and poly_not_moved):
+        # ---- Log opportunity (ALWAYS — for training data) ----
+        opp_id_counter += 1
+        _opp_id = opp_id_counter
+        _spread_yes_c = (float(yes_ask) - float(yes_bid)) * 100.0
+        _spread_no_c = (float(no_ask) - float(no_bid)) * 100.0
+        _lag_ratio = abs(dF_cents) / (abs(dP_yes if best_side == "YES" else dP_no) + 1e-6) if abs(dF_cents) > 1e-6 else 0.0
+        _inv_net = inv_yes - inv_no
+        _inv_gross = inv_yes + inv_no
+        _sigma_eff = cal.sigma_eff_ema
+        _T_left = max(0.0, cal.market_end_ts - time.time()) if cal.market_end_ts > 0 else None
+
+        db_logger.log_opportunity((
+            _opp_id,
+            int(time.time_ns() // 1_000_000),        # t_ms
+            int(time.monotonic_ns()),                 # mono_ns
+            slug,
+            float(yes_bid), float(yes_ask), float(no_bid), float(no_ask),
+            y_mid, n_mid,
+            _spread_yes_c, _spread_no_c,
+            float(bin_mid), dS,
+            float(fair_yes),
+            float(edge_yes_pp), float(edge_no_pp),
+            dF_cents, dP_yes, dP_no,
+            _lag_ratio,
+            inv_yes, inv_no, _inv_net, _inv_gross,
+            _inv_net * 0.5,                           # inv_notional (approx)
+            _sigma_eff, _T_left,
+            _passed_filter,
+        ))
+
+        # Schedule 1-second outcome label
+        pending_opps.append(PendingOpp(
+            opp_id=_opp_id,
+            t_ns=time.monotonic_ns(),
+            slug=slug,
+            yes_ask=float(yes_ask),
+            no_ask=float(no_ask),
+            yes_mid=y_mid,
+            no_mid=n_mid,
+            bin_mid=float(bin_mid),
+            fair_yes=float(fair_yes),
+        ))
+
+        if not _passed_filter:
             prev_bin_mid = float(bin_mid)
             prev_yes_mid = y_mid
             prev_no_mid = n_mid
